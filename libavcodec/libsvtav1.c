@@ -32,15 +32,18 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/base64.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/hdr_dynamic_metadata.h"
 #include "libavutil/mastering_display_metadata.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/avassert.h"
 
+#include "bytestream.h"
 #include "codec_internal.h"
 #include "dovi_rpu.h"
 #include "encode.h"
+#include "itut35.h"
 #include "avcodec.h"
 #include "profiles.h"
 
@@ -551,6 +554,56 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
     return alloc_buffer(&svt_enc->enc_params, svt_enc);
 }
 
+static int add_hdr10plus(AVCodecContext *avctx, EbBufferHeaderType *headerPtr,
+                         const AVFrame *frame)
+{
+    const AVFrameSideData *side_data =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+    AVDynamicHDRPlus *hdr_plus;
+    uint8_t *hdr_plus_buf, *payload;
+    size_t payload_size, hdr_plus_buf_size;
+    int ret;
+
+    if (!side_data)
+        return 0;
+
+    hdr_plus = (AVDynamicHDRPlus *)side_data->data;
+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, NULL, &payload_size);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Error finding the size of HDR10+ metadata\n");
+        return ret;
+    }
+
+    /* extra bytes for country code, provider code,
+     * provider oriented code and application identifier */
+    hdr_plus_buf_size = payload_size + 6;
+    hdr_plus_buf = av_malloc(hdr_plus_buf_size);
+    if (!hdr_plus_buf)
+        return AVERROR(ENOMEM);
+
+    payload = hdr_plus_buf;
+    /* See "HDR10+ AV1 Metadata Handling Specification" v1.0.1, Section 2.1. */
+    bytestream_put_byte(&payload, ITU_T_T35_COUNTRY_CODE_US);
+    bytestream_put_be16(&payload, ITU_T_T35_PROVIDER_CODE_SAMSUNG);
+    bytestream_put_be16(&payload, 0x0001); // provider_oriented_code
+    bytestream_put_byte(&payload, 0x04);   // application_identifier
+
+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &payload, &payload_size);
+    if (ret < 0) {
+        av_free(hdr_plus_buf);
+        av_log(avctx, AV_LOG_ERROR, "Error encoding HDR10+ from side data\n");
+        return ret;
+    }
+
+    ret = svt_add_metadata(headerPtr, EB_AV1_METADATA_TYPE_ITUT_T35,
+                           hdr_plus_buf, hdr_plus_buf_size);
+    av_free(hdr_plus_buf);
+    if (ret < 0)
+        return AVERROR(ENOMEM);
+
+    return 0;
+}
+
 static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 {
     SvtContext           *svt_enc = avctx->priv_data;
@@ -613,6 +666,8 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         return AVERROR_INVALIDDATA;
     }
 
+    if ((ret = add_hdr10plus(avctx, headerPtr, frame)) < 0)
+        return ret;
 
     svt_ret = svt_av1_enc_send_picture(svt_enc->svt_handle, headerPtr);
     if (svt_ret != EB_ErrorNone)
