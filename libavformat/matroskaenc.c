@@ -1410,10 +1410,16 @@ static void mkv_write_video_color(EbmlWriter *writer, const AVStream *st,
                                         AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
     if (side_data) {
         const AVContentLightMetadata *metadata = (AVContentLightMetadata *)side_data->data;
-        ebml_writer_add_uint(writer, MATROSKA_ID_VIDEOCOLORMAXCLL,
-                             metadata->MaxCLL);
-        ebml_writer_add_uint(writer, MATROSKA_ID_VIDEOCOLORMAXFALL,
-                             metadata->MaxFALL);
+        /* Zero is how "unknown" is spelled in a content light level block, so
+         * writing the elements out would turn a missing measurement into a
+         * claim that the content peaks at zero nits. Sources carrying an empty
+         * block are common enough that this reaches the output regularly. */
+        if (metadata->MaxCLL || metadata->MaxFALL) {
+            ebml_writer_add_uint(writer, MATROSKA_ID_VIDEOCOLORMAXCLL,
+                                 metadata->MaxCLL);
+            ebml_writer_add_uint(writer, MATROSKA_ID_VIDEOCOLORMAXFALL,
+                                 metadata->MaxFALL);
+        }
     }
 
     side_data = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
