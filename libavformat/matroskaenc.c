@@ -254,6 +254,7 @@ typedef struct MatroskaMuxContext {
     int                 cluster_size_limit;
     int64_t             cluster_time_limit;
     int                 write_crc;
+    int                 write_hdr_metadata;
     int                 is_live;
 
     int                 is_dash;
@@ -1369,7 +1370,8 @@ fail:
 }
 
 #define MAX_VIDEO_COLOR_ELEMS 20
-static void mkv_write_video_color(EbmlWriter *writer, const AVStream *st,
+static void mkv_write_video_color(const MatroskaMuxContext *mkv,
+                                  EbmlWriter *writer, const AVStream *st,
                                   const AVCodecParameters *par)
 {
     const AVPacketSideData *side_data;
@@ -1408,7 +1410,7 @@ static void mkv_write_video_color(EbmlWriter *writer, const AVStream *st,
 
     side_data = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
                                         AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
-    if (side_data) {
+    if (side_data && mkv->write_hdr_metadata) {
         const AVContentLightMetadata *metadata = (AVContentLightMetadata *)side_data->data;
         /* Zero is how "unknown" is spelled in a content light level block, so
          * writing the elements out would turn a missing measurement into a
@@ -1424,7 +1426,7 @@ static void mkv_write_video_color(EbmlWriter *writer, const AVStream *st,
 
     side_data = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
                                         AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
-    if (side_data) {
+    if (side_data && mkv->write_hdr_metadata) {
         const AVMasteringDisplayMetadata *metadata = (AVMasteringDisplayMetadata *)side_data->data;
         ebml_writer_open_master(writer, MATROSKA_ID_VIDEOCOLORMASTERINGMETA);
         if (metadata->has_primaries) {
@@ -1930,7 +1932,7 @@ static int mkv_write_track_video(AVFormatContext *s, MatroskaMuxContext *mkv,
         ebml_writer_add_bin(&writer, MATROSKA_ID_VIDEOCOLORSPACE,
                             color_space, sizeof(color_space));
     }
-    mkv_write_video_color(&writer, st, par);
+    mkv_write_video_color(mkv, &writer, st, par);
     mkv_write_video_projection(s, &writer, par, projection_private);
 
     return ebml_writer_write(&writer, pb);
@@ -3687,6 +3689,7 @@ static const AVOption options[] = {
     { "allow_raw_vfw", "allow raw VFW mode", OFFSET(allow_raw_vfw), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { "flipped_raw_rgb", "store raw RGB bitmaps in VFW mode in bottom-up mode", OFFSET(flipped_raw_rgb), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { "write_crc32", "write a CRC32 element inside every Level 1 element", OFFSET(write_crc), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+    { "write_hdr_metadata", "write the MaxCLL/MaxFALL and mastering display elements", OFFSET(write_hdr_metadata), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
     { "default_mode", "control how a track's FlagDefault is inferred", OFFSET(default_mode), AV_OPT_TYPE_INT, { .i64 = DEFAULT_MODE_PASSTHROUGH }, DEFAULT_MODE_INFER, DEFAULT_MODE_PASSTHROUGH, FLAGS, .unit = "default_mode" },
     { "infer", "for each track type, mark each track of disposition default as default; if none exists, mark the first track as default", 0, AV_OPT_TYPE_CONST, { .i64 = DEFAULT_MODE_INFER }, 0, 0, FLAGS, .unit = "default_mode" },
     { "infer_no_subs", "for each track type, mark each track of disposition default as default; for audio and video: if none exists, mark the first track as default", 0, AV_OPT_TYPE_CONST, { .i64 = DEFAULT_MODE_INFER_NO_SUBS }, 0, 0, FLAGS, .unit = "default_mode" },
