@@ -136,6 +136,45 @@ Alle Wege enden im selben Aufruf
 `svt_add_metadata(..., EB_AV1_METADATA_TYPE_ITUT_T35, ...)`; der Unterschied
 liegt allein darin, woher die Nutzlast kommt.
 
+## Patch 4 — HDR-Metadaten nicht doppelt in den Container (aktiv)
+
+Zwei Änderungen am Matroska-Muxer, beide aus der Beobachtung entstanden, dass
+MediaInfo an einem fertigen AV1-Encode das Mastering Display zweimal anzeigt
+und MaxCLL/MaxFALL mit 0 cd/m².
+
+**Leerer Content-Light-Block.** In einem CLL-Block heißt Null „unbekannt".
+Trägt die Quelle einen leeren Block — bei UHD-Blu-ray-Rips keine Seltenheit —,
+reichte ffmpeg ihn bisher durch und behauptete im Ziel über MaxCLL und MaxFALL,
+der Inhalt erreiche null Nits. Der Mastering-Display-Block direkt darunter
+schützt seine Elemente mit `has_primaries` und `has_luminance`; die CLL-Seite
+hatte kein Gegenstück. Jetzt werden beide Elemente ausgelassen, wenn MaxCLL und
+MaxFALL null sind. Gilt immer, ohne Schalter.
+
+**Option `-write_hdr_metadata 0`.** Wer die statischen HDR-Werte ohnehin im
+Bitstream hat, speichert sie im Container ein zweites Mal. Bei AV1 ist das der
+Normalfall: SVT-AV1 schreibt ein `HDR_MDCV`-OBU an **jedem Keyframe**, sobald
+man ihm `mastering-display=` mitgibt. Gemessen an einem Encode mit `keyint 240`:
+
+```
+600 Frames ab Minute 2 gescannt
+  ITUT_T35 provider=0x003B  (Dolby Vision RPU)   600 x   -> jeder Frame
+  ITUT_T35 provider=0x003C  (HDR10+)             600 x   -> jeder Frame
+  HDR_MDCV                                         3 x   -> alle 240 Frames
+```
+
+Dreimal in 600 Frames bei keyint 240 ist genau eines pro Keyframe. Wer mitten
+in den Film springt, landet auf einem Keyframe und bekommt die Werte dort —
+die Container-Kopie trägt also nichts bei. Das war die Frage, an der die
+Entscheidung hing: schriebe SVT das OBU nur einmal am Dateianfang, wäre der
+Container-Eintrag die einzige Absicherung fürs Spulen und dürfte nicht weg.
+
+Die Option ist voreingestellt an, das Verhalten ändert sich also nur, wenn man
+es verlangt. Ausgeschaltet entfallen Mastering Display und Content Light; die
+Farbbeschreibung (Transfer, Primaries, Matrix, Range) bleibt stehen, weil sie
+wenige Bytes kostet und Werkzeugen erlaubt, die Datei ohne Bitstream-Analyse
+als HDR zu erkennen. Der sonst übliche Umweg — rohe IVF extrahieren und mit
+mkvmerge neu muxen — wirft demgegenüber auch die Farbbeschreibung weg.
+
 ## Build
 
 ```
