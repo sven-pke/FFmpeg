@@ -97,6 +97,45 @@ Dune (2021)   : L(4000.0000,0.0050)  content-light=787,239
 Ein Skript, das den String aus der Quelle erzeugt, liegt außerhalb dieses
 Repos unter `hdrparams.py`.
 
+## Patch 3 — Film-Grain-Tabellen aus ffmpeg heraus (aktiv)
+
+SVT-AV1 kann eine Film-Grain-Tabelle im `filmgrn1`-Format lesen, aber nur in
+seiner eigenen Anwendung: `SvtAv1EncApp --fgs-table`. Der Parser sitzt in
+`Source/App/app_config.c` (`read_fgs_table()`), die Bibliothek bekommt lediglich
+den fertigen `AomFilmGrain*` über `EbSvtAv1EncConfiguration.fgs_table` und
+öffnet nie selbst eine Datei. Über `-svtav1-params` ist das Feld nicht
+erreichbar, weil dort nur Zahlen geparst werden, keine Pfade.
+
+Der Patch fügt dem Wrapper deshalb eine eigene Option hinzu:
+
+```
+-fgs_table <pfad>
+```
+
+Er liest die Tabelle (Parser der SVT-App nachgebaut, ergänzt um
+Bereichsprüfungen — die Zählwerte aus der Datei indizieren Arrays fester Größe,
+was die Vorlage nicht absichert), legt den geparsten Satz im Kontext ab und
+reicht den Zeiger an `param->fgs_table` weiter. Freigabe in `eb_enc_close()`.
+
+Zwei Eigenschaften der SVT-Seite, die man kennen muss:
+
+* **Nur der erste Eintrag der Tabelle wird benutzt.** Im Quellcode steht dazu
+  `// TODO Add functionality to read multiple grain table entries`. Szenenweise
+  Tabellen sind damit wirkungslos — für ein einheitliches Korn über eine ganze
+  Sammlung ist das aber genau das gewünschte Verhalten.
+* **Mit Tabelle wird nicht entrauscht.** `pic_analysis_process.c` verzweigt
+  entweder in `apply_film_grain_table()` oder in `denoise_estimate_film_grain()`,
+  nie in beides. Nachgewiesen: mit und ohne `-fgs_table` sind die kodierten
+  Pixel bit-identisch (gleicher MD5 bei abgeschalteter Korn-Synthese im
+  Dekoder), es kommen nur die Header-Parameter hinzu.
+
+Andere Forks lösen dasselbe Problem dateibasiert: SVT-AV1-PSY und
+SVT-AV1-Essential binden `libhdr10plus-rs` und `libdovi` ein und erwarten
+vorab extrahierte JSON- bzw. RPU-Dateien, ebenfalls nur in `Source/App/`.
+Alle Wege enden im selben Aufruf
+`svt_add_metadata(..., EB_AV1_METADATA_TYPE_ITUT_T35, ...)`; der Unterschied
+liegt allein darin, woher die Nutzlast kommt.
+
 ## Build
 
 ```
