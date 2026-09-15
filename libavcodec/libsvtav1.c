@@ -28,6 +28,7 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/common.h"
+#include "libavutil/file_open.h"
 #include "libavutil/frame.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/base64.h"
@@ -78,6 +79,8 @@ typedef struct SvtContext {
     int enc_mode;
     int crf;
     int qp;
+    char *fgs_table_path;
+    AomFilmGrain *fgs_table;
 } SvtContext;
 
 static const struct {
@@ -210,6 +213,165 @@ static void handle_side_data(AVCodecContext *avctx,
         handle_mdcv(&param->mastering_display,
                     (AVMasteringDisplayMetadata *)mdcv_sd->data);
     }
+}
+
+/*
+ * Reader for the "filmgrn1" film grain table format, as written by aomenc's
+ * photon_noise_table example and by grav1synth.
+ *
+ * SVT-AV1 implements this parser only in its own application front end
+ * (Source/App/app_config.c, read_fgs_table()); the library takes the parsed
+ * struct as a pointer and never looks at a file, so the wrapper has to do the
+ * reading itself. The parsing below follows that implementation, with added
+ * range checks - the counts read from the file index fixed-size arrays.
+ *
+ * Note that SVT-AV1 applies one grain model to the whole sequence: only the
+ * first entry of a multi-segment table is used, the rest is ignored.
+ */
+static int svt_read_fgs_table(AVCodecContext *avctx, const char *path,
+                              AomFilmGrain **out)
+{
+    AomFilmGrain *fg = NULL;
+    FILE *file;
+    char magic[9];
+    int i, n, ret = AVERROR_INVALIDDATA;
+
+    file = avpriv_fopen_utf8(path, "r");
+    if (!file) {
+        av_log(avctx, AV_LOG_ERROR, "Could not open film grain table '%s'\n", path);
+        return AVERROR(EINVAL);
+    }
+
+    /* one extra byte for the newline that follows the magic */
+    if (fread(magic, 1, sizeof(magic), file) != sizeof(magic) ||
+        memcmp(magic, "filmgrn1", 8)) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' is not a film grain table "
+               "(missing filmgrn1 magic)\n", path);
+        goto fail;
+    }
+
+    fg = av_mallocz(sizeof(*fg));
+    if (!fg) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    if (fscanf(file, "E %*d %*d %d %hu %d\n", &fg->apply_grain,
+               &fg->random_seed, &fg->update_parameters) != 3) {
+        av_log(avctx, AV_LOG_ERROR, "Could not read the entry header of '%s'\n", path);
+        goto fail;
+    }
+
+    if (!fg->update_parameters) {
+        av_log(avctx, AV_LOG_ERROR, "The first entry of '%s' carries no grain "
+               "parameters\n", path);
+        goto fail;
+    }
+
+    if (fscanf(file, "p %d %d %d %d %d %d %d %d %d %d %d %d\n",
+               &fg->ar_coeff_lag, &fg->ar_coeff_shift, &fg->grain_scale_shift,
+               &fg->scaling_shift, &fg->chroma_scaling_from_luma,
+               &fg->overlap_flag, &fg->cb_mult, &fg->cb_luma_mult,
+               &fg->cb_offset, &fg->cr_mult, &fg->cr_luma_mult,
+               &fg->cr_offset) != 12) {
+        av_log(avctx, AV_LOG_ERROR, "Could not read the grain parameters of '%s'\n", path);
+        goto fail;
+    }
+
+    if (fg->ar_coeff_lag < 0 || fg->ar_coeff_lag > 3) {
+        av_log(avctx, AV_LOG_ERROR, "ar_coeff_lag %d in '%s' is out of range [0, 3]\n",
+               fg->ar_coeff_lag, path);
+        goto fail;
+    }
+
+    if (fscanf(file, "\tsY %d ", &fg->num_y_points) != 1 ||
+        fg->num_y_points < 0 || fg->num_y_points > 14) {
+        av_log(avctx, AV_LOG_ERROR, "Bad luma scaling point count in '%s'\n", path);
+        goto fail;
+    }
+    for (i = 0; i < fg->num_y_points; i++) {
+        if (fscanf(file, "%d %d", &fg->scaling_points_y[i][0],
+                   &fg->scaling_points_y[i][1]) != 2) {
+            av_log(avctx, AV_LOG_ERROR, "Could not read luma scaling point %d of '%s'\n", i, path);
+            goto fail;
+        }
+    }
+
+    if (fscanf(file, "\n\tsCb %d", &fg->num_cb_points) != 1 ||
+        fg->num_cb_points < 0 || fg->num_cb_points > 10) {
+        av_log(avctx, AV_LOG_ERROR, "Bad Cb scaling point count in '%s'\n", path);
+        goto fail;
+    }
+    for (i = 0; i < fg->num_cb_points; i++) {
+        if (fscanf(file, "%d %d", &fg->scaling_points_cb[i][0],
+                   &fg->scaling_points_cb[i][1]) != 2) {
+            av_log(avctx, AV_LOG_ERROR, "Could not read Cb scaling point %d of '%s'\n", i, path);
+            goto fail;
+        }
+    }
+
+    if (fscanf(file, "\n\tsCr %d", &fg->num_cr_points) != 1 ||
+        fg->num_cr_points < 0 || fg->num_cr_points > 10) {
+        av_log(avctx, AV_LOG_ERROR, "Bad Cr scaling point count in '%s'\n", path);
+        goto fail;
+    }
+    for (i = 0; i < fg->num_cr_points; i++) {
+        if (fscanf(file, "%d %d", &fg->scaling_points_cr[i][0],
+                   &fg->scaling_points_cr[i][1]) != 2) {
+            av_log(avctx, AV_LOG_ERROR, "Could not read Cr scaling point %d of '%s'\n", i, path);
+            goto fail;
+        }
+    }
+
+    n = 2 * fg->ar_coeff_lag * (fg->ar_coeff_lag + 1);
+
+    if (fscanf(file, "\n\tcY")) {
+        av_log(avctx, AV_LOG_ERROR, "Could not read the cY header of '%s'\n", path);
+        goto fail;
+    }
+    for (i = 0; i < n; i++) {
+        if (fscanf(file, "%d", &fg->ar_coeffs_y[i]) != 1) {
+            av_log(avctx, AV_LOG_ERROR, "Could not read luma AR coefficient %d of '%s'\n", i, path);
+            goto fail;
+        }
+    }
+
+    if (fscanf(file, "\n\tcCb")) {
+        av_log(avctx, AV_LOG_ERROR, "Could not read the cCb header of '%s'\n", path);
+        goto fail;
+    }
+    for (i = 0; i <= n; i++) {
+        if (fscanf(file, "%d", &fg->ar_coeffs_cb[i]) != 1) {
+            av_log(avctx, AV_LOG_ERROR, "Could not read Cb AR coefficient %d of '%s'\n", i, path);
+            goto fail;
+        }
+    }
+
+    if (fscanf(file, "\n\tcCr")) {
+        av_log(avctx, AV_LOG_ERROR, "Could not read the cCr header of '%s'\n", path);
+        goto fail;
+    }
+    for (i = 0; i <= n; i++) {
+        if (fscanf(file, "%d", &fg->ar_coeffs_cr[i]) != 1) {
+            av_log(avctx, AV_LOG_ERROR, "Could not read Cr AR coefficient %d of '%s'\n", i, path);
+            goto fail;
+        }
+    }
+
+    /* The encoder always synthesises the grain it was handed, and must not
+     * inherit grain parameters from a reference frame. Same as the SVT-AV1
+     * application does after parsing. */
+    fg->apply_grain = 1;
+    fg->ignore_ref  = 1;
+
+    fclose(file);
+    *out = fg;
+    return 0;
+
+fail:
+    av_free(fg);
+    fclose(file);
+    return ret;
 }
 
 static int config_enc_params(EbSvtAv1EncConfiguration *param,
@@ -442,6 +604,19 @@ static int config_enc_params(EbSvtAv1EncConfiguration *param,
         cpb_props->buffer_size = avctx->rc_buffer_size;
         cpb_props->max_bitrate = avctx->rc_max_rate;
         cpb_props->avg_bitrate = avctx->bit_rate;
+    }
+
+    if (svt_enc->fgs_table_path) {
+        int err = svt_read_fgs_table(avctx, svt_enc->fgs_table_path,
+                                     &svt_enc->fgs_table);
+        if (err < 0)
+            return err;
+        param->fgs_table = svt_enc->fgs_table;
+        av_log(avctx, AV_LOG_VERBOSE,
+               "Film grain table '%s': %d luma / %d Cb / %d Cr scaling points, "
+               "AR lag %d\n", svt_enc->fgs_table_path,
+               svt_enc->fgs_table->num_y_points, svt_enc->fgs_table->num_cb_points,
+               svt_enc->fgs_table->num_cr_points, svt_enc->fgs_table->ar_coeff_lag);
     }
 
     return 0;
@@ -836,6 +1011,7 @@ static av_cold int eb_enc_close(AVCodecContext *avctx)
 
     av_buffer_pool_uninit(&svt_enc->pool);
     av_frame_free(&svt_enc->frame);
+    av_freep(&svt_enc->fgs_table);
     ff_dovi_ctx_unref(&svt_enc->dovi);
     av_freep(&svt_enc->stats_buf);
 
@@ -883,6 +1059,7 @@ static const AVOption options[] = {
     { "qp", "Initial Quantizer level value", OFFSET(qp),
       AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 63, VE },
     { "svtav1-params", "Set the SVT-AV1 configuration using a :-separated list of key=value parameters", OFFSET(svtav1_opts), AV_OPT_TYPE_DICT, { 0 }, 0, 0, VE },
+    { "fgs_table", "Path to a film grain table in the filmgrn1 format", OFFSET(fgs_table_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
 
     { "dolbyvision", "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
     {   "auto", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = FF_DOVI_AUTOMATIC}, .flags = VE, .unit = "dovi" },
